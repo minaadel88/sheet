@@ -1,8 +1,8 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import html2canvas from 'html2canvas';
 import { jsPDF } from 'jspdf';
-import { Download, FileDown } from 'lucide-react';
+import { Download, FileDown, Loader2 } from 'lucide-react';
 
 interface BalanceSheet {
   id: string;
@@ -11,6 +11,9 @@ interface BalanceSheet {
   start_balance: number;
   notes: string;
   created_at: string;
+  total_income?: number;
+  total_expenses?: number;
+  net_balance?: number;
 }
 
 interface ApartmentPayment {
@@ -33,6 +36,7 @@ function BalanceSheetHistory() {
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
   const [isGeneratingPDF, setIsGeneratingPDF] = useState(false);
+  const [loadingBalances, setLoadingBalances] = useState<{ [key: string]: boolean }>({});
 
   useEffect(() => {
     fetchBalanceSheets();
@@ -46,13 +50,50 @@ function BalanceSheetHistory() {
         return;
       }
 
-      const { data, error } = await supabase
+      const { data: sheets, error } = await supabase
         .from('balance_sheets')
         .select('*')
-        .order('created_at', { ascending: false });
+        .order('start_date', { ascending: false });
 
       if (error) throw error;
-      setBalanceSheets(data || []);
+
+      // Fetch totals for each balance sheet
+      const sheetsWithTotals = await Promise.all((sheets || []).map(async (sheet) => {
+        setLoadingBalances(prev => ({ ...prev, [sheet.id]: true }));
+        
+        try {
+          const [
+            { data: apartmentPayments },
+            { data: incomeEntries },
+            { data: expenseEntries }
+          ] = await Promise.all([
+            supabase.from('apartment_payments').select('amount, paid').eq('balance_sheet_id', sheet.id),
+            supabase.from('income_entries').select('amount').eq('balance_sheet_id', sheet.id),
+            supabase.from('expense_entries').select('amount').eq('balance_sheet_id', sheet.id)
+          ]);
+
+          const totalApartmentPayments = (apartmentPayments || [])
+            .filter(p => p.paid)
+            .reduce((sum, p) => sum + (p.amount || 0), 0);
+
+          const totalIncome = (incomeEntries || [])
+            .reduce((sum, entry) => sum + (entry.amount || 0), 0);
+
+          const totalExpenses = (expenseEntries || [])
+            .reduce((sum, entry) => sum + (entry.amount || 0), 0);
+
+          return {
+            ...sheet,
+            total_income: totalApartmentPayments + totalIncome,
+            total_expenses: totalExpenses,
+            net_balance: sheet.start_balance + totalApartmentPayments + totalIncome - totalExpenses
+          };
+        } finally {
+          setLoadingBalances(prev => ({ ...prev, [sheet.id]: false }));
+        }
+      }));
+
+      setBalanceSheets(sheetsWithTotals);
     } catch (error) {
       console.error('Error fetching balance sheets:', error);
       alert('حدث خطأ أثناء تحميل سجل الميزانيات');
@@ -61,72 +102,181 @@ function BalanceSheetHistory() {
     }
   };
 
+  const generatePDF = async (canvas: HTMLCanvasElement, filename: string) => {
+    const pdf = new jsPDF({
+      orientation: 'p',
+      unit: 'mm',
+      format: 'a4',
+      compress: true
+    });
+
+    const pageWidth = pdf.internal.pageSize.getWidth();
+    const pageHeight = pdf.internal.pageSize.getHeight();
+    const margin = 10;
+    const contentWidth = pageWidth - (margin * 2);
+    
+    const contentHeight = (canvas.height * contentWidth) / canvas.width;
+    
+    let remainingHeight = contentHeight;
+    let sourceY = 0;
+    let currentPage = 0;
+
+    while (remainingHeight > 0) {
+      if (currentPage > 0) {
+        pdf.addPage();
+      }
+
+      const pageContentHeight = Math.min(remainingHeight, pageHeight - (margin * 2));
+      
+      const sourceHeight = (pageContentHeight * canvas.height) / contentHeight;
+      
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = canvas.width;
+      tempCanvas.height = sourceHeight;
+      const ctx = tempCanvas.getContext('2d');
+      
+      if (ctx) {
+        ctx.drawImage(
+          canvas,
+          0, sourceY, canvas.width, sourceHeight,
+          0, 0, canvas.width, sourceHeight
+        );
+        
+        const imgData = tempCanvas.toDataURL('image/jpeg', 1.0);
+        pdf.addImage(
+          imgData,
+          'JPEG',
+          margin,
+          margin,
+          contentWidth,
+          pageContentHeight,
+          '',
+          'FAST'
+        );
+      }
+
+      remainingHeight -= pageContentHeight;
+      sourceY += sourceHeight;
+      currentPage++;
+    }
+
+    pdf.save(filename);
+  };
+
   const generateBalanceSheetContent = async (balanceSheet: any, apartmentPayments: any[], incomeEntries: any[], expenseEntries: any[]) => {
     const container = document.createElement('div');
-    container.className = 'p-4 bg-white';
-    container.style.width = '800px';
+    container.className = 'p-8 bg-white';
+    container.style.width = '1000px';
     container.style.direction = 'rtl';
-    container.innerHTML = `
-      <h1 class="text-2xl font-bold text-center mb-4">ميزانية صندوق عمارة 32 عمارات الاخاء</h1>
-      <p class="text-lg text-center mb-4">(عمارات الشرطة)</p>
-      
-      <div class="mb-4">
-        <p class="font-bold">الفترة: ${new Date(balanceSheet.start_date).toLocaleDateString('ar-EG')} إلى ${new Date(balanceSheet.end_date).toLocaleDateString('ar-EG')}</p>
-        <p class="font-bold">الرصيد الافتتاحي: ${balanceSheet.start_balance} جنيه</p>
-      </div>
+    container.style.fontFamily = 'Arial, sans-serif';
 
-      <div class="mb-4">
-        <h2 class="text-xl font-bold mb-2">اشتراكات الشقق</h2>
-        <div class="grid grid-cols-2 gap-2">
-          ${apartmentPayments.map(payment => `
-            <div class="p-2 border rounded ${payment.paid ? 'bg-green-50' : ''}">
-              <p class="font-bold">${payment.apartment_number}</p>
-              <p>${payment.resident_name}</p>
-              <p>${payment.amount} جنيه ${payment.paid ? '(تم الدفع)' : ''}</p>
+    const totalApartmentPayments = calculateTotal(apartmentPayments.filter(p => p.paid));
+    const totalIncome = calculateTotal(incomeEntries);
+    const totalExpenses = calculateTotal(expenseEntries);
+    const netBalance = balanceSheet.start_balance + totalApartmentPayments + totalIncome - totalExpenses;
+
+    const apartmentPaymentsHTML = [];
+    for (let i = 0; i < apartmentPayments.length; i += 4) {
+        const row = apartmentPayments.slice(i, i + 4);
+        apartmentPaymentsHTML.push(`
+            <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 8px;">
+                ${row.map(payment => `
+                    <div style="padding: 8px; border: 1px solid #e5e7eb; border-radius: 8px; background-color: ${payment.paid ? '#f0fdf4' : '#ffffff'}; font-size: 14px;">
+                        <p style="font-weight: bold; margin: 0 0 4px 0;">${payment.apartment_number}</p>
+                        <p style="margin: 0 0 4px 0; font-size: 12px;">${payment.resident_name}</p>
+                        <p style="margin: 0; color: ${payment.paid ? '#059669' : '#374151'};">
+                            ${payment.amount} جنيه ${payment.paid ? '✓' : ''}
+                        </p>
+                    </div>
+                `).join('')}
             </div>
-          `).join('')}
+        `);
+    }
+
+    container.innerHTML = `
+        <div style="max-width: 100%; margin: 0 auto;">
+            <h1 style="font-size: 24px; font-weight: bold; text-align: center; margin-bottom: 16px; color: #1f2937;">
+                ميزانية صندوق عمارة 32 عمارات الاخاء
+            </h1>
+            <p style="font-size: 18px; text-align: center; margin-bottom: 24px; color: #4b5563;">
+                (عمارات الشرطة)
+            </p>
+            
+            <div style="background-color: #f9fafb; padding: 16px; border-radius: 8px; margin-bottom: 24px;">
+                <p style="font-weight: bold; margin-bottom: 8px; font-size: 16px;">
+                    الفترة: ${new Date(balanceSheet.start_date).toLocaleDateString('ar-EG')} إلى ${new Date(balanceSheet.end_date).toLocaleDateString('ar-EG')}
+                </p>
+                <p style="font-weight: bold; font-size: 16px;">
+                    الرصيد الافتتاحي: ${balanceSheet.start_balance} جنيه
+                </p>
+            </div>
+
+            <div style="margin-bottom: 32px;">
+                <h2 style="font-size: 20px; font-weight: bold; margin-bottom: 16px; color: #1f2937; border-bottom: 2px solid #e5e7eb; padding-bottom: 8px;">
+                    اشتراكات الشقق
+                </h2>
+                ${apartmentPaymentsHTML.join('')}
+            </div>
+
+            <div style="margin-bottom: 32px;">
+                <h2 style="font-size: 20px; font-weight: bold; margin-bottom: 16px; color: #1f2937; border-bottom: 2px solid #e5e7eb; padding-bottom: 8px;">
+                    الدخل الإضافي
+                </h2>
+                <div style="display: grid; gap: 8px;">
+                    ${incomeEntries.map(entry => `
+                        <div style="padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; background-color: #ffffff;">
+                            <p style="font-weight: bold; margin: 0 0 4px 0;">${entry.description}</p>
+                            <p style="margin: 0; color: #059669;">${entry.amount} جنيه</p>
+                        </div>
+                    `).join('')}
+                </div>
+            </div>
+
+            <div style="margin-bottom: 32px;">
+                <h2 style="font-size: 20px; font-weight: bold; margin-bottom: 16px; color: #1f2937; border-bottom: 2px solid #e5e7eb; padding-bottom: 8px;">
+                    المصروفات
+                </h2>
+                <div style="display: grid; gap: 8px;">
+                    ${expenseEntries.map(entry => `
+                        <div style="padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; background-color: #ffffff;">
+                            <p style="font-weight: bold; margin: 0 0 4px 0;">${entry.description}</p>
+                            <p style="margin: 0; color: #dc2626;">${entry.amount} جنيه</p>
+                        </div>
+                    `).join('')}
+                </div>
+            </div>
+
+            <div style="background-color: #f9fafb; padding: 20px; border-radius: 8px; margin-top: 32px;">
+                <h2 style="font-size: 20px; font-weight: bold; margin-bottom: 16px; color: #1f2937;">
+                    ملخص الميزانية
+                </h2>
+                <div style="display: grid; gap: 8px; font-size: 16px;">
+                    <p style="margin: 0;"><strong>إجمالي اشتراكات الشقق:</strong> ${totalApartmentPayments} جنيه</p>
+                    <p style="margin: 0;"><strong>إجمالي الدخل الإضافي:</strong> ${totalIncome} جنيه</p>
+                    <p style="margin: 0;"><strong>إجمالي المصروفات:</strong> ${totalExpenses} جنيه</p>
+                    <p style="margin: 0; font-size: 18px; font-weight: bold; color: ${netBalance >= 0 ? '#059669' : '#dc2626'}; padding-top: 8px; border-top: 1px solid #e5e7eb;">
+                        صافي الرصيد: ${netBalance} جنيه
+                    </p>
+                </div>
+            </div>
+
+            ${balanceSheet.notes ? `
+                <div style="margin-top: 32px;">
+                    <h2 style="font-size: 20px; font-weight: bold; margin-bottom: 16px; color: #1f2937;">ملاحظات</h2>
+                    <p style="padding: 12px; border: 1px solid #e5e7eb; border-radius: 8px; background-color: #ffffff;">${balanceSheet.notes}</p>
+                </div>
+            ` : ''}
         </div>
-      </div>
-
-      <div class="mb-4">
-        <h2 class="text-xl font-bold mb-2">الدخل الإضافي</h2>
-        ${incomeEntries.map(entry => `
-          <div class="p-2 border rounded mb-2">
-            <p class="font-bold">${entry.description}</p>
-            <p>${entry.amount} جنيه</p>
-          </div>
-        `).join('')}
-      </div>
-
-      <div class="mb-4">
-        <h2 class="text-xl font-bold mb-2">المصروفات</h2>
-        ${expenseEntries.map(entry => `
-          <div class="p-2 border rounded mb-2">
-            <p class="font-bold">${entry.description}</p>
-            <p>${entry.amount} جنيه</p>
-          </div>
-        `).join('')}
-      </div>
-
-      <div class="mt-4 p-2 border-t">
-        <p class="font-bold">إجمالي الدخل: ${calculateTotal(incomeEntries) + calculateTotal(apartmentPayments.filter(p => p.paid))} جنيه</p>
-        <p class="font-bold">إجمالي المصروفات: ${calculateTotal(expenseEntries)} جنيه</p>
-        <p class="font-bold">صافي الرصيد: ${balanceSheet.start_balance + calculateTotal(incomeEntries) + calculateTotal(apartmentPayments.filter(p => p.paid)) - calculateTotal(expenseEntries)} جنيه</p>
-      </div>
-
-      ${balanceSheet.notes ? `
-        <div class="mt-4">
-          <h2 class="text-xl font-bold mb-2">ملاحظات</h2>
-          <p>${balanceSheet.notes}</p>
-        </div>
-      ` : ''}
     `;
 
     document.body.appendChild(container);
     const canvas = await html2canvas(container, {
-      scale: 2,
-      useCORS: true,
-      allowTaint: true
+        scale: 2,
+        useCORS: true,
+        allowTaint: true,
+        logging: false,
+        windowWidth: 1000,
+        windowHeight: container.offsetHeight
     });
     document.body.removeChild(container);
     return canvas;
@@ -134,9 +284,10 @@ function BalanceSheetHistory() {
 
   const generateSummaryContent = async (sheetsData: any[]) => {
     const container = document.createElement('div');
-    container.className = 'p-4 bg-white';
+    container.className = 'p-8 bg-white';
     container.style.width = '800px';
     container.style.direction = 'rtl';
+    container.style.fontFamily = 'Arial, sans-serif';
 
     let totalStartBalance = 0;
     let totalApartmentPayments = 0;
@@ -152,44 +303,60 @@ function BalanceSheetHistory() {
 
     const firstSheet = sheetsData[0].balanceSheet;
     const lastSheet = sheetsData[sheetsData.length - 1].balanceSheet;
+    const netBalance = totalStartBalance + totalApartmentPayments + totalIncomeEntries - totalExpenseEntries;
 
     container.innerHTML = `
-      <h1 class="text-2xl font-bold text-center mb-4">ملخص ميزانيات صندوق عمارة 32 عمارات الاخاء</h1>
-      <p class="text-lg text-center mb-4">(عمارات الشرطة)</p>
+      <h1 style="font-size: 24px; font-weight: bold; text-align: center; margin-bottom: 16px;">
+        ملخص ميزانيات صندوق عمارة 32 عمارات الاخاء
+      </h1>
+      <p style="font-size: 18px; text-align: center; margin-bottom: 24px;">
+        (عمارات الشرطة)
+      </p>
       
-      <div class="mb-6">
-        <p class="font-bold">الفترة: ${new Date(firstSheet.start_date).toLocaleDateString('ar-EG')} إلى ${new Date(lastSheet.end_date).toLocaleDateString('ar-EG')}</p>
+      <div style="margin-bottom: 32px;">
+        <p style="font-weight: bold; font-size: 18px;">
+          الفترة: ${new Date(firstSheet.start_date).toLocaleDateString('ar-EG')} إلى ${new Date(lastSheet.end_date).toLocaleDateString('ar-EG')}
+        </p>
       </div>
 
-      <div class="space-y-4">
-        <div class="p-4 bg-gray-50 rounded-lg">
-          <h2 class="text-xl font-bold mb-4">ملخص الفترة</h2>
-          <div class="space-y-2">
-            <p class="font-bold">إجمالي الرصيد الافتتاحي: ${totalStartBalance} جنيه</p>
-            <p class="font-bold">إجمالي اشتراكات الشقق: ${totalApartmentPayments} جنيه</p>
-            <p class="font-bold">إجمالي الدخل الإضافي: ${totalIncomeEntries} جنيه</p>
-            <p class="font-bold">إجمالي المصروفات: ${totalExpenseEntries} جنيه</p>
-            <p class="font-bold text-lg mt-4 ${totalStartBalance + totalApartmentPayments + totalIncomeEntries - totalExpenseEntries >= 0 ? 'text-green-600' : 'text-red-600'}">
-              صافي الرصيد: ${totalStartBalance + totalApartmentPayments + totalIncomeEntries - totalExpenseEntries} جنيه
-            </p>
-          </div>
+      <div style="margin-bottom: 32px; padding: 24px; background-color: #f9fafb; border-radius: 12px;">
+        <h2 style="font-size: 20px; font-weight: bold; margin-bottom: 16px;">ملخص الفترة</h2>
+        <div style="display: grid; gap: 12px;">
+          <p style="font-weight: bold;">إجمالي الرصيد الافتتاحي: ${totalStartBalance} جنيه</p>
+          <p style="font-weight: bold;">إجمالي اشتراكات الشقق: ${totalApartmentPayments} جنيه</p>
+          <p style="font-weight: bold;">إجمالي الدخل الإضافي: ${totalIncomeEntries} جنيه</p>
+          <p style="font-weight: bold;">إجمالي المصروفات: ${totalExpenseEntries} جنيه</p>
+          <p style="font-weight: bold; font-size: 20px; margin-top: 16px; color: ${netBalance >= 0 ? '#059669' : '#dc2626'}">
+            صافي الرصيد: ${netBalance} جنيه
+          </p>
         </div>
+      </div>
 
-        <div class="mt-6">
-          <h2 class="text-xl font-bold mb-4">تفاصيل الميزانيات</h2>
-          ${sheetsData.map(data => `
-            <div class="p-4 border rounded-lg mb-4">
-              <h3 class="font-bold">ميزانية ${new Date(data.balanceSheet.start_date).toLocaleDateString('ar-EG')} إلى ${new Date(data.balanceSheet.end_date).toLocaleDateString('ar-EG')}</h3>
-              <div class="mt-2 space-y-1">
+      <div style="margin-top: 32px;">
+        <h2 style="font-size: 20px; font-weight: bold; margin-bottom: 24px;">تفاصيل الميزانيات</h2>
+        ${sheetsData.map(data => {
+          const sheetNetBalance = data.balanceSheet.start_balance + 
+            calculateTotal(data.apartmentPayments.filter((p: any) => p.paid)) + 
+            calculateTotal(data.incomeEntries) - 
+            calculateTotal(data.expenseEntries);
+          
+          return `
+            <div style="padding: 16px; border: 1px solid #e5e7eb; border-radius: 12px; margin-bottom: 16px;">
+              <h3 style="font-weight: bold; margin-bottom: 12px;">
+                ميزانية ${new Date(data.balanceSheet.start_date).toLocaleDateString('ar-EG')} إلى ${new Date(data.balanceSheet.end_date).toLocaleDateString('ar-EG')}
+              </h3>
+              <div style="display: grid; gap: 8px;">
                 <p>الرصيد الافتتاحي: ${data.balanceSheet.start_balance} جنيه</p>
                 <p>اشتراكات الشقق: ${calculateTotal(data.apartmentPayments.filter((p: any) => p.paid))} جنيه</p>
                 <p>الدخل الإضافي: ${calculateTotal(data.incomeEntries)} جنيه</p>
                 <p>المصروفات: ${calculateTotal(data.expenseEntries)} جنيه</p>
-                <p class="font-bold">صافي الرصيد: ${data.balanceSheet.start_balance + calculateTotal(data.apartmentPayments.filter((p: any) => p.paid)) + calculateTotal(data.incomeEntries) - calculateTotal(data.expenseEntries)} جنيه</p>
+                <p style="font-weight: bold; color: ${sheetNetBalance >= 0 ? '#059669' : '#dc2626'}">
+                  صافي الرصيد: ${sheetNetBalance} جنيه
+                </p>
               </div>
             </div>
-          `).join('')}
-        </div>
+          `;
+        }).join('')}
       </div>
     `;
 
@@ -197,7 +364,10 @@ function BalanceSheetHistory() {
     const canvas = await html2canvas(container, {
       scale: 2,
       useCORS: true,
-      allowTaint: true
+      allowTaint: true,
+      logging: false,
+      windowWidth: 800,
+      windowHeight: container.offsetHeight
     });
     document.body.removeChild(container);
     return canvas;
@@ -230,32 +400,7 @@ function BalanceSheetHistory() {
         expenseEntries || []
       );
 
-      const pdf = new jsPDF({
-        orientation: 'p',
-        unit: 'mm',
-        format: 'a4'
-      });
-
-      const imgData = canvas.toDataURL('image/jpeg', 1.0);
-      const pageWidth = pdf.internal.pageSize.getWidth();
-      const pageHeight = pdf.internal.pageSize.getHeight();
-      const imgWidth = pageWidth - 20;
-      const imgHeight = (canvas.height * imgWidth) / canvas.width;
-
-      let heightLeft = imgHeight;
-      let position = 10;
-
-      pdf.addImage(imgData, 'JPEG', 10, position, imgWidth, imgHeight);
-      heightLeft -= pageHeight;
-
-      while (heightLeft >= 0) {
-        position = heightLeft - imgHeight;
-        pdf.addPage();
-        pdf.addImage(imgData, 'JPEG', 10, position, imgWidth, imgHeight);
-        heightLeft -= pageHeight;
-      }
-
-      pdf.save(`ميزانية-${new Date(balanceSheet.start_date).toLocaleDateString('ar-EG')}.pdf`);
+      await generatePDF(canvas, `ميزانية-${new Date(balanceSheet.start_date).toLocaleDateString('ar-EG')}.pdf`);
     } catch (error) {
       console.error('Error generating PDF:', error);
       alert('حدث خطأ أثناء إنشاء ملف PDF');
@@ -297,33 +442,7 @@ function BalanceSheetHistory() {
       );
 
       const canvas = await generateSummaryContent(sheetsData);
-
-      const pdf = new jsPDF({
-        orientation: 'p',
-        unit: 'mm',
-        format: 'a4'
-      });
-
-      const imgData = canvas.toDataURL('image/jpeg', 1.0);
-      const pageWidth = pdf.internal.pageSize.getWidth();
-      const pageHeight = pdf.internal.pageSize.getHeight();
-      const imgWidth = pageWidth - 20;
-      const imgHeight = (canvas.height * imgWidth) / canvas.width;
-
-      let heightLeft = imgHeight;
-      let position = 10;
-
-      pdf.addImage(imgData, 'JPEG', 10, position, imgWidth, imgHeight);
-      heightLeft -= pageHeight;
-
-      while (heightLeft >= 0) {
-        position = heightLeft - imgHeight;
-        pdf.addPage();
-        pdf.addImage(imgData, 'JPEG', 10, position, imgWidth, imgHeight);
-        heightLeft -= pageHeight;
-      }
-
-      pdf.save(`ملخص-الميزانيات-${new Date().toLocaleDateString('ar-EG')}.pdf`);
+      await generatePDF(canvas, `ملخص-الميزانيات-${new Date().toLocaleDateString('ar-EG')}.pdf`);
     } catch (error) {
       console.error('Error generating combined PDF:', error);
       alert('حدث خطأ أثناء إنشاء ملف PDF المجمع');
@@ -420,28 +539,46 @@ function BalanceSheetHistory() {
                   <p className="text-sm text-gray-600">
                     تم الإنشاء: {new Date(sheet.created_at).toLocaleDateString('ar-EG')}
                   </p>
+                  {!loadingBalances[sheet.id] && (
+                    <div className="mt-2 space-y-1">
+                      <p className="text-sm">الرصيد الافتتاحي: {sheet.start_balance} جنيه</p>
+                      <p className="text-sm">إجمالي الدخل: {sheet.total_income} جنيه</p>
+                      <p className="text-sm">إجمالي المصروفات: {sheet.total_expenses} جنيه</p>
+                      <p className={`text-sm font-bold ${sheet.net_balance >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                        صافي الرصيد: {sheet.net_balance} جنيه
+                      </p>
+                    </div>
+                  )}
                 </div>
                 <div className="flex gap-2">
-                  <button
-                    onClick={() => downloadBalanceSheet(sheet.id)}
-                    disabled={isGeneratingPDF}
-                    className="bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700 transition-colors disabled:bg-gray-400 flex items-center gap-1"
-                  >
-                    <Download size={16} />
-                    تحميل PDF
-                  </button>
-                  <input
-                    type="checkbox"
-                    checked={selectedSheets.includes(sheet.id)}
-                    onChange={(e) => {
-                      if (e.target.checked) {
-                        setSelectedSheets([...selectedSheets, sheet.id]);
-                      } else {
-                        setSelectedSheets(selectedSheets.filter(id => id !== sheet.id));
-                      }
-                    }}
-                    className="w-5 h-5 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
-                  />
+                  {loadingBalances[sheet.id] ? (
+                    <div className="flex items-center">
+                      <Loader2 className="animate-spin" size={16} />
+                    </div>
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => downloadBalanceSheet(sheet.id)}
+                        disabled={isGeneratingPDF}
+                        className="bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700 transition-colors disabled:bg-gray-400 flex items-center gap-1"
+                      >
+                        <Download size={16} />
+                        تحميل PDF
+                      </button>
+                      <input
+                        type="checkbox"
+                        checked={selectedSheets.includes(sheet.id)}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setSelectedSheets([...selectedSheets, sheet.id]);
+                          } else {
+                            setSelectedSheets(selectedSheets.filter(id => id !== sheet.id));
+                          }
+                        }}
+                        className="w-5 h-5 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                      />
+                    </>
+                  )}
                 </div>
               </div>
               {sheet.notes && (
