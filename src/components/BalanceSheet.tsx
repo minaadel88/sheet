@@ -202,22 +202,59 @@ function BalanceSheet() {
 
       const pageWidth = pdf.internal.pageSize.getWidth();
       const pageHeight = pdf.internal.pageSize.getHeight();
-      const margin = 15;
+      const margin = 10;
+      const contentWidth = pageWidth - (margin * 2);
+      
+      const contentHeight = (canvas.height * contentWidth) / canvas.width;
+      
+      let remainingHeight = contentHeight;
+      let sourceY = 0;
+      let currentPage = 0;
 
-      const imgData = canvas.toDataURL('image/jpeg', 1.0);
-      const imgWidth = pageWidth - (margin * 2);
-      const imgHeight = (canvas.height * imgWidth) / canvas.width;
+      while (remainingHeight > 0) {
+        // Add a new page for each iteration except the first
+        if (currentPage > 0) {
+          pdf.addPage();
+        }
 
-      let position = margin;
-      let heightLeft = imgHeight;
+        // Calculate the height for this page
+        const pageContentHeight = Math.min(remainingHeight, pageHeight - (margin * 2));
+        
+        // Calculate the corresponding height in the source canvas
+        const sourceHeight = (pageContentHeight * canvas.height) / contentHeight;
+        
+        // Create a temporary canvas for this page section
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = canvas.width;
+        tempCanvas.height = sourceHeight;
+        const ctx = tempCanvas.getContext('2d');
+        
+        if (ctx) {
+          // Draw the appropriate portion of the source canvas
+          ctx.drawImage(
+            canvas,
+            0, sourceY, canvas.width, sourceHeight,
+            0, 0, canvas.width, sourceHeight
+          );
+          
+          // Add this section to the PDF
+          const imgData = tempCanvas.toDataURL('image/jpeg', 1.0);
+          pdf.addImage(
+            imgData,
+            'JPEG',
+            margin,
+            margin,
+            contentWidth,
+            pageContentHeight,
+            '',
+            'FAST'
+          );
+        }
 
-      pdf.addImage(imgData, 'JPEG', margin, position, imgWidth, imgHeight, '', 'FAST');
-      heightLeft -= (pageHeight - margin * 2);
-
-      if (heightLeft > 0) {
-        position = -(pageHeight + margin);
-        pdf.addPage();
-        pdf.addImage(imgData, 'JPEG', margin, position, imgWidth, imgHeight, '', 'FAST');
+        // Update variables for next iteration
+        remainingHeight -= pageContentHeight;
+        sourceY += sourceHeight;
+        currentPage++;
       }
 
       pdf.save('الميزانية-المالية.pdf');
